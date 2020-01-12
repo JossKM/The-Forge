@@ -44,6 +44,9 @@
 #include "../../../../Common_3/Renderer/IRenderer.h"
 #include "../../../../Common_3/Renderer/ResourceLoader.h"
 
+// Mesh loading
+#include "../../../../Common_3/Tools/AssimpImporter/AssimpImporter.h"
+
 // Middleware packages
 #include "../../../../Middleware_3/Animation/SkeletonBatcher.h"
 #include "../../../../Middleware_3/Animation/AnimatedObject.h"
@@ -53,9 +56,12 @@
 #include "../../../../Middleware_3/Animation/Rig.h"
 
 #include "../../../../Middleware_3/UI/AppUI.h"
+
+
 // tiny stl
 #include "../../../../Common_3/ThirdParty/OpenSource/EASTL/vector.h"
 #include "../../../../Common_3/ThirdParty/OpenSource/EASTL/string.h"
+
 
 // Math
 #include "../../../../Common_3/OS/Math/MathTypes.h"
@@ -210,6 +216,42 @@ UIData gUIData;
 
 // Hard set the controller's time ratio via callback when it is set in the UI
 void StandClipTimeChangeCallback() { gStandClipController.SetTimeRatioHard(gUIData.mStandClip.mAnimationTime); }
+
+
+
+#define MAX_NUM_BONES 200
+
+// Vertex definition for skinned mesh loading
+struct Vertex
+{
+	float3 mPosition;
+	float3 mNormal;
+	float2 mUV;
+	float4 mBoneWeights;
+	uint4  mBoneIndices;
+};
+
+struct UniformDataBones
+{
+	mat4 mBoneMatrix[MAX_NUM_BONES];
+};
+
+class Character
+{
+	Buffer* pVertexBuffer = NULL;
+	Buffer* pIndexBuffer = NULL;
+	uint             gIndexCount = 0;
+	Buffer* pBoneOffsetBuffer = NULL;
+	Buffer* pUniformBufferBones[gImageCount] = { NULL };
+	UniformDataBones gUniformDataBones;
+	Texture* pTextureDiffuse = NULL;
+	PathHandle fullPath;
+	PathHandle texturePath;
+
+	bool loadMesh(const char* meshName, const char* textureName);
+};
+
+Character trooper;
 
 //--------------------------------------------------------------------------------------------
 // APP CODE
@@ -457,6 +499,26 @@ class AimIK: public IApp
 		gTwoBonesIKDesc.mMidAxis = Vector3::zAxis();
 		gStickFigureRig.FindJointChain(twoBonesJointNames, 3, gTwoBonesIKDesc.mJointChain);
 		/************************************************************************/
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 		finishResourceLoading();
 
@@ -1030,3 +1092,120 @@ class AimIK: public IApp
 };
 
 DEFINE_APPLICATION_MAIN(AimIK)
+
+bool Character::loadMesh(const char* meshName, const char* textureName)
+{
+/************************************************************************/
+// LOAD SKINNED MESH
+/************************************************************************/
+	fullPath = fsCopyPathInResourceDirectory(RD_ANIMATIONS, meshName);
+
+	AssimpImporter        importer;
+	AssimpImporter::Model model = {};
+	if (!importer.ImportModel(fullPath, &model))
+		return false;
+
+	eastl::vector<Vertex> vertices;
+	eastl::vector<uint>   indices;
+	eastl::vector<mat4>   boneOffsetMatrices(gStickFigureRig.GetNumJoints(), mat4::identity());
+	for (uint i = 0; i < (uint)model.mMeshArray.size(); ++i)
+	{
+		AssimpImporter::Mesh* mesh = &model.mMeshArray[i];
+		uint                  startVertices = (uint)vertices.size();
+		uint                  vertexCount = (uint)mesh->mPositions.size();
+		mat4 localToWorldMat = mat4::identity();
+		const AssimpImporter::Node* node = importer.FindMeshNode(&model.mRootNode, i);
+		if (node)
+			localToWorldMat = node->mTransform;
+
+		vertices.resize(startVertices + vertexCount);
+		for (uint j = 0; j < vertexCount; ++j)
+		{
+			vec4 pos = vec4(mesh->mPositions[j].x, mesh->mPositions[j].y, mesh->mPositions[j].z, 1);
+			vec4 normal = vec4(mesh->mNormals[j].x, mesh->mNormals[j].y, mesh->mNormals[j].z, 0);
+			vertices[startVertices + j].mPosition = v3ToF3((localToWorldMat * pos).getXYZ());
+			vertices[startVertices + j].mNormal = v3ToF3(normalize((localToWorldMat * normal).getXYZ()));
+			vertices[startVertices + j].mUV = mesh->mUvs[j];
+		}
+
+		if (!mesh->mBoneNames.empty() && !mesh->mBoneWeights.empty())
+		{
+			for (uint j = 0; j < vertexCount; ++j)
+			{
+				vertices[startVertices + j].mBoneWeights = mesh->mBoneWeights[j];
+				for (uint k = 0; k < 4; ++k)
+				{
+					if (mesh->mBoneWeights[j][k] > 0.0f)
+					{
+						int boneIndex = gStickFigureRig.FindJoint(mesh->mBoneNames[j].mNames[k].c_str());
+						vertices[startVertices + j].mBoneIndices[k] = (uint)boneIndex;
+					}
+				}
+			}
+
+			for (size_t j = 0; j < mesh->mBones.size(); ++j)
+			{
+				int jointIndex = gStickFigureRig.FindJoint(mesh->mBones[j].mName.c_str());
+				if (jointIndex >= 0)
+					boneOffsetMatrices[jointIndex] = mesh->mBones[j].mOffsetMatrix * inverse(localToWorldMat);
+			}
+		}
+
+		uint startIndices = (uint)indices.size();
+		uint indexCount = (uint)mesh->mIndices.size();
+		indices.resize(startIndices + indexCount);
+		for (uint j = 0; j < indexCount; ++j)
+			indices[startIndices + j] = mesh->mIndices[j] + startVertices;
+	}
+
+	gIndexCount = (uint)indices.size();
+
+	BufferLoadDesc vertexBufferDesc = {};
+	vertexBufferDesc.mDesc.mDescriptors = DESCRIPTOR_TYPE_VERTEX_BUFFER;
+	vertexBufferDesc.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+	vertexBufferDesc.mDesc.mSize = sizeof(Vertex) * vertices.size();
+	vertexBufferDesc.mDesc.mVertexStride = sizeof(Vertex);
+	vertexBufferDesc.pData = vertices.data();
+	vertexBufferDesc.ppBuffer = &pVertexBuffer;
+	addResource(&vertexBufferDesc);
+
+	BufferLoadDesc indexBufferDesc = {};
+	indexBufferDesc.mDesc.mDescriptors = DESCRIPTOR_TYPE_INDEX_BUFFER;
+	indexBufferDesc.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+	indexBufferDesc.mDesc.mSize = sizeof(uint) * indices.size();
+	indexBufferDesc.mDesc.mIndexType = INDEX_TYPE_UINT32;
+	indexBufferDesc.mDesc.mFlags = BUFFER_CREATION_FLAG_OWN_MEMORY_BIT;
+	indexBufferDesc.pData = indices.data();
+	indexBufferDesc.ppBuffer = &pIndexBuffer;
+	addResource(&indexBufferDesc);
+
+	BufferLoadDesc boneOffsetBufferDesc = {};
+	boneOffsetBufferDesc.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+	boneOffsetBufferDesc.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_GPU_ONLY;
+	boneOffsetBufferDesc.mDesc.mSize = sizeof(mat4) * gStickFigureRig.GetNumJoints();
+	boneOffsetBufferDesc.pData = boneOffsetMatrices.data();
+	boneOffsetBufferDesc.ppBuffer = &pBoneOffsetBuffer;
+	addResource(&boneOffsetBufferDesc);
+
+	BufferLoadDesc boneBufferDesc = {};
+	boneBufferDesc.mDesc.mDescriptors = DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+	boneBufferDesc.mDesc.mMemoryUsage = RESOURCE_MEMORY_USAGE_CPU_TO_GPU;
+	boneBufferDesc.mDesc.mFlags = BUFFER_CREATION_FLAG_PERSISTENT_MAP_BIT;
+	boneBufferDesc.mDesc.mSize = sizeof(mat4) * gStickFigureRig.GetNumJoints();
+	boneBufferDesc.pData = NULL;
+	for (int i = 0; i < gImageCount; ++i)
+	{
+		boneBufferDesc.ppBuffer = &pUniformBufferBones[i];
+		addResource(&boneBufferDesc);
+	}
+
+	texturePath = fsCopyPathInResourceDirectory(RD_TEXTURES, textureName);
+	TextureLoadDesc diffuseTextureDesc = {};
+	diffuseTextureDesc.pFilePath = texturePath;
+	diffuseTextureDesc.ppTexture = &pTextureDiffuse;
+	addResource(&diffuseTextureDesc);
+
+	/************************************************************************/
+}
+
+#undef MAX_NUM_BONES
